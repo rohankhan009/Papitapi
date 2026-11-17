@@ -4,7 +4,30 @@ Bulk SMS distribution system built with Python, Telegram Bot API, and Firebase R
 
 ---
 
-## 🆕 What's fixed & faster (latest update)
+## 🆕 Version 3 — naya bottom menu
+
+- ⌨️ **Persistent bottom menu** — chat ke niche hamesha bade tap-friendly buttons
+  (Send Bulk SMS, Upload Data File, Message Templates, Manage Firebase, Devices,
+  Status, History, Settings, Daily Usage, Help). `/start` dabate hi aa jaate hain.
+- 📅 **Daily Usage** screen — aaj kitne SMS bheje/fail hue, campaign-wise.
+- 📤 **Behtar live progress** — Sent / Failed / Pending, `msg/s` speed, Phones count
+  aur ETA (reference UI jaisa).
+
+---
+
+## 🆕 Version 2 — naye features
+
+- 🚦 **Rate-Limit Control** — Settings mein global SMS/min cap (Off / 30 / 60 / 120 / 300).
+- 📋 **CSV Delivery Logs** — har campaign ke end par poori delivery CSV apne-aap chat mein aa jaati hai (number, status, device, time, error).
+- ⏰ **Auto-Schedule** — campaign ko baad ke time par chalao (`+30`, `14:30`, ya `2026-01-20 09:00`).
+- 📊 **Live Dashboard Refresh** — dashboard har 6 sec auto-update (▶️/⏹ toggle).
+- 📋 **Bulk Firebase Add** — ek saath kai Firebase URLs paste karke add karo.
+
+> Note: Scheduled campaigns bot ke chalte rehne par hi fire hote hain. Agar bot restart hota hai to pending schedules dobara set karne padenge (standalone script limitation).
+
+---
+
+## 🆕 What's fixed & faster (earlier update)
 
 - ⚡ **Firebase scan 2x+ faster** — har database ab ek hi baar fetch hota hai
   (pehle poora `/clients` tree do baar download hota tha), connection pooling +

