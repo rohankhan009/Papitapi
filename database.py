@@ -278,6 +278,34 @@ class Database:
         conn.commit()
         conn.close()
 
+    def bulk_update_target_status(self, campaign_id: str, updates: list):
+        """Flush many target updates in ONE connection/transaction.
+        updates: list of (target_id, status, device_id, error)."""
+        if not updates:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = [(s, d, now, e, campaign_id, tid) for (tid, s, d, e) in updates]
+        conn = self._conn()
+        conn.executemany(
+            "UPDATE campaign_targets SET status=?, device_id=?, processed_at=?, error=? WHERE campaign_id=? AND target_id=?",
+            rows
+        )
+        conn.commit()
+        conn.close()
+
+    def requeue_failed_targets(self, campaign_id: str) -> int:
+        """Reset FAILED targets back to PENDING so they can be resent.
+        Returns how many were requeued."""
+        conn = self._conn()
+        cur = conn.execute(
+            "UPDATE campaign_targets SET status='PENDING', error='', device_id='' WHERE campaign_id=? AND status='FAILED'",
+            (campaign_id,)
+        )
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+        return n
+
     def update_campaign_counters(self, campaign_id: str):
         conn = self._conn()
         completed = conn.execute(
@@ -357,6 +385,18 @@ class Database:
         ).fetchone()
         conn.close()
         return (row['cnt'] if row else 0) + 1
+
+    def get_campaign_count(self, user_id: int) -> int:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM campaigns WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        conn.close()
+        return row['cnt'] if row else 0
+
+    def get_user_templates(self, user_id: int) -> List[dict]:
+        return self.get_templates(user_id)
 
     # ========== USER SETTINGS ==========
     def get_user_settings(self, user_id: int) -> dict:

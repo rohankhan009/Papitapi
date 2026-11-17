@@ -4,6 +4,26 @@ Bulk SMS distribution system built with Python, Telegram Bot API, and Firebase R
 
 ---
 
+## 🆕 What's fixed & faster (latest update)
+
+- ⚡ **Firebase scan 2x+ faster** — har database ab ek hi baar fetch hota hai
+  (pehle poora `/clients` tree do baar download hota tha), connection pooling +
+  retries ke saath, aur multiple Firebases ab **parallel** scan hote hain.
+- 🚀 **SMS sending ab truly parallel** — saare device workers background threads
+  par chalte hain (blocking requests event-loop ko rok nahi rahe), aur DB writes
+  ab batch mein hote hain → 100k numbers smoothly.
+- 🔁 **Resend Failed** button — sirf fail hue numbers dobara bhejo.
+- 📥 **Export Numbers** button — campaign ke numbers `.txt` mein download karo.
+- 🐛 **Bug fixes** — main menu ke counts ab sahi dikhte hain; campaign SIM slot
+  ab sahi (SIM 1 = slot 0, SIM 2 = slot 1).
+- 🖥️ VPS sizing + setup guide: dekho **VPS_GUIDE.md**.
+
+**TL;DR VPS:** 100k/din ke liye **2 vCPU / 4 GB RAM / 50–80 GB SSD** kaafi hai
+(bottleneck gateway hota hai, CPU nahi). Details VPS_GUIDE.md mein.
+
+
+---
+
 ## ⚡ How It Works
 
 ```

